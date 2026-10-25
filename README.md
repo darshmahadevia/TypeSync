@@ -2,7 +2,7 @@
 
 A collaborative rich-text editor with live cursors, document sharing, and an AI co-editor. Write together in real time and review AI suggestions before they change the document.
 
-[Try the live demo]()
+[Try TypeSync](https://typesync.darshmahadevia.tech)
 
 ## What you can do
 
@@ -59,6 +59,14 @@ Use Node.js 24 or later, npm, and Docker.
 Open [localhost:5173](http://localhost:5173), create an account, and verify your email before signing in. The backend runs on port 3000.
 
 Run `npm run check` for lint, type checks, regression tests, and a production build.
+
+## Production deployment
+
+Vercel builds `client/` and serves [typesync.darshmahadevia.tech](https://typesync.darshmahadevia.tech). Render builds the root Dockerfile and serves [api.typesync.darshmahadevia.tech](https://api.typesync.darshmahadevia.tech). Both deploy from the private GitHub repository's `main` branch. `render.yaml` records the backend configuration. Neon hosts PostgreSQL. Resend sends verification emails from `no-reply@mail.typesync.darshmahadevia.tech`.
+
+Set `VITE_API_URL=https://api.typesync.darshmahadevia.tech` in Vercel's production environment. Keep database credentials, the auth secret, and provider keys in Render's environment settings. The migration login owns the schema. The runtime login has table access only.
+
+Run `node scripts/verify-deployment.mjs` to check the public frontend, database readiness, auth endpoint, CORS, and Socket.IO handshake. To check provider URLs before custom DNS is ready, set `FRONTEND_URL`, `BACKEND_URL`, and `CLIENT_ORIGIN`. Keep `CLIENT_ORIGIN=https://typesync.darshmahadevia.tech` to match the server's allowed origin.
 
 ## Diagnose failed HTTP requests
 
