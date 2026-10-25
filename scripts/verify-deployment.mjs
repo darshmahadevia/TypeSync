@@ -7,6 +7,7 @@ const { fetch, AbortSignal } = globalThis;
 
 const frontend = process.env.FRONTEND_URL ?? 'https://typesync.darshmahadevia.tech';
 const backend = process.env.BACKEND_URL ?? 'https://api.typesync.darshmahadevia.tech';
+const clientOrigin = process.env.CLIENT_ORIGIN ?? frontend;
 const timeout = () => AbortSignal.timeout(90_000);
 
 for (const path of ['/', '/auth/signin']) {
@@ -23,10 +24,10 @@ console.log('PASS backend and database readiness');
 
 const preflight = await fetch(`${backend}/api/documents`, {
   method: 'OPTIONS',
-  headers: { Origin: frontend, 'Access-Control-Request-Method': 'POST' },
+  headers: { Origin: clientOrigin, 'Access-Control-Request-Method': 'POST' },
   signal: timeout(),
 });
-assert.equal(preflight.headers.get('access-control-allow-origin'), frontend);
+assert.equal(preflight.headers.get('access-control-allow-origin'), clientOrigin);
 assert.equal(preflight.headers.get('access-control-allow-credentials'), 'true');
 console.log('PASS credentialed CORS');
 
@@ -35,7 +36,10 @@ assert.equal(session.status, 200, 'Auth endpoint');
 assert.equal(await session.json(), null);
 console.log('PASS anonymous auth session');
 
-const socket = await fetch(`${backend}/socket.io/?EIO=4&transport=polling`, { signal: timeout() });
+const socket = await fetch(`${backend}/socket.io/?EIO=4&transport=polling`, {
+  headers: { Origin: clientOrigin },
+  signal: timeout(),
+});
 assert.equal(socket.status, 200, 'Socket.IO handshake');
 assert.match(await socket.text(), /^0\{"sid":/);
 console.log('PASS Socket.IO handshake');
