@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: typesync-api
+    runtime: docker
+    plan: free
+    region: virginia
+    healthCheckPath: /api/ready
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: VITE_CLIENT_URL
+        value: https://typesync.darshmahadevia.tech
+      - key: BETTER_AUTH_URL
+        value: https://api.typesync.darshmahadevia.tech
+      - key: AUTH_COOKIE_SAME_SITE
+        value: lax
+      - key: EMAIL_FROM
+        value: TypeSync <no-reply@mail.typesync.darshmahadevia.tech>
+      - key: BETTER_AUTH_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
+      - key: MIGRATION_DATABASE_URL
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false

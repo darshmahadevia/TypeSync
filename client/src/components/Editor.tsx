@@ -1,0 +1,334 @@
+import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { useEditor, useEditorState, EditorContent, type Editor as TiptapEditor } from "@tiptap/react";
+import { createContentExtensions } from "@typesync/shared/editor-schema";
+import CharacterCount from "@tiptap/extension-character-count";
+
+import Placeholder from "@tiptap/extension-placeholder";
+import Collaboration from "@tiptap/extension-collaboration";
+import { yUndoPluginKey } from "@tiptap/y-tiptap";
+import { columnResizingPluginKey } from "@tiptap/pm/tables";
+import * as Y from "yjs";
+import { z } from "zod";
+import { aiAcceptanceOrigin, applyAiAcceptance } from "../lib/ai-acceptance";
+import { motion } from "motion/react";
+import { useCollaborativeDocument } from "../lib/hooks/useCollaborativeDocument";
+import {
+  mountSmoothCollaborationCarets,
+  SmoothCollaborationCaret,
+} from "../lib/smooth-collaboration-carets";
+import { EditorToolbar } from "./EditorToolbar";
+import { EditorSlashMenu } from "./EditorSlashMenu";
+import { AiCoEditor } from "./AiCoEditor";
+import { useConfirm } from "../lib/confirm-context";
+import { needsLeaveProtection, type DocumentStatus } from "../lib/document-status";
+import { canEditDocument, type PresenceIdentity, type Role } from "@typesync/shared";
+
+interface EditorProps {
+  documentId: string;
+  role: Role;
+  onCollaboratorsChange?: (collaborators: PresenceIdentity[]) => void;
+  onAccessLost?: () => void;
+  /** Publishes sync, size and pending state so the header can report it. */
+  onStatusChange?: (status: DocumentStatus | null) => void;
+  /** Publishes the live instance so document-level actions can reach it. */
+  onEditorChange?: (editor: TiptapEditor | null) => void;
+}
+
+const UndoStateSchema = z.object({ undoManager: z.instanceof(Y.UndoManager) });
+
+export function Editor({
+  documentId,
+  role,
+  onCollaboratorsChange,
+  onAccessLost,
+  onStatusChange,
+  onEditorChange,
+}: EditorProps) {
+  const confirm = useConfirm();
+  const [acceptanceEditor, setAcceptanceEditor] = useState<TiptapEditor | null>(null);
+  const [slashMenu, setSlashMenu] = useState<{
+    isOpen: boolean;
+    position: { top: number; left: number };
+  }>({
+    isOpen: false,
+    position: { top: 0, left: 0 },
+  });
+  const {
+    ydoc,
+    awareness,
+    documentSizeStatus,
+    hasPendingUpdates,
+    awaitingPersistence,
+    syncStatus,
+    syncError,
+    isSyncBlocked,
+    retrying,
+    sessionRole,
+    recover,
+    registerAcceptanceHandler,
+  } = useCollaborativeDocument(documentId, onCollaboratorsChange, onAccessLost);
+  const effectiveRole = sessionRole ?? role;
+  const canEdit = canEditDocument(effectiveRole) && !isSyncBlocked;
+
+  // The guarded form is what gets published, so no caller can discard unsynced
+  // edits without asking first.
+  const confirmAndRecover = useCallback(() => {
+    void confirm({
+      title: "Discard pending changes",
+      message:
+        "Edits that have not reached the server will be lost, and the latest version will be reloaded from the server.",
+      confirmLabel: "Discard and reload",
+      tone: "danger",
+    }).then((accepted) => {
+      if (accepted) recover();
+    });
+  }, [confirm, recover]);
+
+  const closeInactiveSlashMenu = ({ editor }: { editor: TiptapEditor }) => {
+    const { selection } = editor.state;
+    const slashIsStillActive =
+      editor.isEditable &&
+      selection.empty &&
+      selection.$from.parent.isTextblock &&
+      selection.$from.parent.textContent === "/" &&
+      selection.$from.parentOffset === 1;
+
+    if (!slashIsStillActive) {
+      setSlashMenu((prev) => (prev.isOpen ? { ...prev, isOpen: false } : prev));
+    }
+  };
+
+  const editor = useEditor(
+    {
+      extensions: [
+        ...createContentExtensions(),
+        CharacterCount,
+        Placeholder.configure({
+          placeholder: "Start writing… Type / for commands",
+        }),
+        Collaboration.configure({
+          document: ydoc,
+        }),
+        SmoothCollaborationCaret.configure({
+          provider: { awareness },
+          user: {
+            userId: "",
+            name: "Connecting…",
+            color: "#5a6b7c",
+          },
+        }),
+      ],
+      editorProps: {
+        attributes: {
+          class: "tiptap",
+          "aria-label": "Document content",
+          "aria-multiline": "true",
+        },
+        handleTextInput(view, from, to, text) {
+          const { selection } = view.state;
+          const isEmptyTextBlock =
+            view.editable &&
+            text === "/" &&
+            from === to &&
+            selection.empty &&
+            selection.$from.parent.isTextblock &&
+            selection.$from.parent.content.size === 0;
+
+          if (isEmptyTextBlock) {
+            const coords = view.coordsAtPos(from);
+            setSlashMenu({
+              isOpen: true,
+              position: {
+                top: coords.bottom + 6,
+                left: coords.left,
+              },
+            });
+          }
+
+          return false;
+        },
+      },
+      onUpdate: closeInactiveSlashMenu,
+      onSelectionUpdate: closeInactiveSlashMenu,
+      editable: canEdit,
+    },
+    // `canEdit` is deliberately absent: a dependency change destroys and
+    // recreates the editor, which drops selection, focus and scroll position.
+    // It flips on role change and on sync being
+    // blocked — the last of which is the worst moment to move the caret. The
+    // effect below applies it to the live instance instead.
+    [documentId, ydoc, awareness]
+  );
+
+  useLayoutEffect(() => {
+    if (editor && !canEdit && columnResizingPluginKey.getState(editor.state)?.dragging) {
+      editor.view.dispatch(editor.state.tr.setMeta(columnResizingPluginKey, { setHandle: -1 }));
+    }
+    editor?.setEditable(canEdit);
+    if (!canEdit) {
+      setSlashMenu((prev) => (prev.isOpen ? { ...prev, isOpen: false } : prev));
+    }
+  }, [editor, canEdit]);
+
+  useEffect(() => {
+    if (!editor) return;
+    let unregister: (() => void) | undefined;
+    const attach = () => {
+      if (editor.isDestroyed || unregister) return;
+      const state = UndoStateSchema.safeParse(yUndoPluginKey.getState(editor.state));
+      if (!state.success) return;
+      const { undoManager } = state.data;
+      undoManager.addTrackedOrigin(aiAcceptanceOrigin);
+      unregister = registerAcceptanceHandler(update => {
+        if (editor.isDestroyed) return false;
+        applyAiAcceptance(ydoc, update, undoManager);
+        return true;
+      });
+      setAcceptanceEditor(editor);
+    };
+    const detach = () => {
+      unregister?.();
+      unregister = undefined;
+      setAcceptanceEditor(null);
+    };
+    attach();
+    editor.on("create", attach);
+    editor.on("mount", attach);
+    editor.on("unmount", detach);
+    return () => {
+      editor.off("create", attach);
+      editor.off("mount", attach);
+      editor.off("unmount", detach);
+      detach();
+    };
+  }, [editor, ydoc, registerAcceptanceHandler]);
+
+  const counts = useEditorState({
+    editor,
+    selector: ({ editor: current }) => ({
+      characters: current.storage.characterCount?.characters?.() ?? 0,
+      words: current.storage.characterCount?.words?.() ?? 0,
+    }),
+  });
+  const characterCount = counts?.characters ?? 0;
+  const wordCount = counts?.words ?? 0;
+
+  useEffect(() => {
+    if (!editor) return;
+
+    let detach: (() => void) | undefined;
+    let frame: number | null = null;
+
+    // `editor.view` throws while the editor has no view — either it has not been
+    // mounted yet or it was already destroyed. Wait for the view instead.
+    const attach = () => {
+      frame = null;
+      if (detach || editor.isDestroyed) return;
+
+      const editorElement = editor.view.dom;
+      const overlayContainer = editorElement.closest<HTMLElement>(
+        ".editor-scroll-area"
+      );
+      if (!overlayContainer) {
+        frame = window.requestAnimationFrame(attach);
+        return;
+      }
+
+      detach = mountSmoothCollaborationCarets(
+        editorElement,
+        overlayContainer,
+        awareness
+      );
+    };
+
+    attach();
+    editor.on("mount", attach);
+
+    return () => {
+      editor.off("mount", attach);
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      detach?.();
+    };
+  }, [editor, awareness]);
+
+  useEffect(() => {
+    onEditorChange?.(editor);
+    return () => onEditorChange?.(null);
+  }, [editor, onEditorChange]);
+
+  useEffect(() => {
+    onStatusChange?.({
+      syncStatus,
+      hasPendingUpdates,
+      awaitingPersistence,
+      documentSizeStatus,
+      syncError,
+      isSyncBlocked,
+      retrying,
+      recover: confirmAndRecover,
+    });
+  }, [
+    awaitingPersistence,
+    confirmAndRecover,
+    documentSizeStatus,
+    hasPendingUpdates,
+    isSyncBlocked,
+    onStatusChange,
+    retrying,
+    syncError,
+    syncStatus,
+  ]);
+
+  useEffect(() => {
+    return () => onStatusChange?.(null);
+  }, [onStatusChange]);
+
+  useEffect(() => {
+    if (!needsLeaveProtection({ hasPendingUpdates, awaitingPersistence })) return;
+
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [hasPendingUpdates, awaitingPersistence]);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      transition={{ duration: 0.2 }}
+      className="h-full flex flex-col min-h-0"
+    >
+      <EditorToolbar editor={editor} canEdit={canEdit} />
+
+      <AiCoEditor key={`${documentId}-${ydoc.clientID}`} documentId={documentId} editor={editor} ydoc={ydoc} role={effectiveRole} syncReady={acceptanceEditor === editor && editor !== null && syncStatus === "synced" && !hasPendingUpdates && !isSyncBlocked}>
+        <div className="editor-scroll-area relative flex-1 min-w-0 overflow-auto bg-bg-secondary/40 sm:py-8 sm:px-4 py-2 px-0 flex justify-center">
+          <div className="w-full max-w-2xl bg-bg-elevated min-h-[calc(100vh-10rem)] h-fit">
+            <EditorContent key={ydoc.clientID} editor={editor} />
+          </div>
+        </div>
+      </AiCoEditor>
+
+      {canEdit && slashMenu.isOpen && editor?.isEditable && (
+        <EditorSlashMenu
+          editor={editor}
+          position={slashMenu.position}
+          onClose={() => setSlashMenu((prev) => ({ ...prev, isOpen: false }))}
+        />
+      )}
+
+      <div className="shrink-0 px-4 py-1 border-t border-border bg-bg-secondary/30 flex items-center justify-end gap-3">
+        <span className="text-micro text-text-muted font-medium">
+          {wordCount.toLocaleString()} {wordCount === 1 ? "word" : "words"}
+        </span>
+        <span className="text-micro text-text-muted font-medium">
+          {characterCount.toLocaleString()}{" "}
+          {characterCount === 1 ? "character" : "characters"}
+        </span>
+      </div>
+    </motion.div>
+  );
+}

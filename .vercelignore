@@ -1,0 +1,6 @@
+.audit/
+.git/
+**/.env
+**/.env.*
+**/dist/
+**/node_modules/

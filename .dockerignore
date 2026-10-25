@@ -1,0 +1,15 @@
+node_modules
+client/*
+!client/package.json
+**/dist
+.git
+.gitignore
+.audit
+.vercel
+**/.env
+**/.env.*
+README.md
+docker-compose.yml
+*.tsbuildinfo
+.vscode/
+.idea/
