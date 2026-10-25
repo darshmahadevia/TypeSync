@@ -16,11 +16,11 @@ A collaborative rich-text editor with live cursors, document sharing, and an AI 
 
 TipTap handles the editor, while Yjs merges concurrent edits using a conflict-free replicated data type, or CRDT. Socket.IO carries document updates and presence between clients and the Express server. REST endpoints handle document management and sharing. PostgreSQL stores document state and AI suggestion history.
 
-The implementation accounts for changes that happen while people work together:
+Sync, permissions, and AI acceptance follow these rules:
 
 - The client queues pending edits and retries delivery after reconnecting. It marks a document as synced only after the server confirms PostgreSQL persistence.
 - The server enforces document permissions when collaborators join and submit edits.
-- AI suggestions use Yjs relative positions to follow a selected passage as surrounding text moves. Acceptance checks the original text, formatting, and character identity so a suggestion cannot overwrite a changed passage.
+- Yjs relative positions keep AI suggestions attached to selected text as surrounding text moves. Before acceptance, TypeSync checks the original text, formatting, and character identity. A changed passage blocks acceptance.
 
 ## Built with
 
@@ -62,7 +62,7 @@ Run `npm run check` for lint, type checks, regression tests, and a production bu
 
 ## Production deployment
 
-Vercel builds `client/` and serves [typesync.darshmahadevia.tech](https://typesync.darshmahadevia.tech). Render builds the root Dockerfile and serves [api.typesync.darshmahadevia.tech](https://api.typesync.darshmahadevia.tech). Both deploy from the private GitHub repository's `main` branch. `render.yaml` records the backend configuration. Neon hosts PostgreSQL. Resend sends verification emails from `no-reply@mail.typesync.darshmahadevia.tech`.
+Vercel builds `client/` and serves [typesync.darshmahadevia.tech](https://typesync.darshmahadevia.tech). Render builds the root Dockerfile and serves [api.typesync.darshmahadevia.tech](https://api.typesync.darshmahadevia.tech). Both deploy from the GitHub repository's `main` branch. `render.yaml` records the backend configuration. Neon hosts PostgreSQL. Resend sends verification emails from `no-reply@mail.typesync.darshmahadevia.tech`.
 
 Set `VITE_API_URL=https://api.typesync.darshmahadevia.tech` in Vercel's production environment. Keep database credentials, the auth secret, and provider keys in Render's environment settings. The migration login owns the schema. The runtime login has table access only.
 
@@ -70,26 +70,30 @@ Run `node scripts/verify-deployment.mjs` to check the public frontend, database 
 
 ## Diagnose failed HTTP requests
 
-Express responses include a generated `X-Request-ID`. Completed responses with status 400 or higher emit one `Request failed` record with that ID, final status, allowlisted method, a known route template when available, and failure kind. Match the browser response header to the server log. Request records omit concrete URLs, query strings, headers, bodies, document and user IDs, and raw errors.
+Express responses include a generated `X-Request-ID`. Each completed response with status 400 or higher emits one `Request failed` record. It includes the request ID, final status, allowlisted method, a known route template when available, and failure kind. Match the browser response header to the server log. Request records omit concrete URLs, query strings, headers, bodies, document and user IDs, and raw errors.
 
-This covers completed Express responses. Socket.IO failures, requests rejected before Express, and aborted responses are outside this scope. Other application and dependency logs have separate behavior.
+These records cover completed Express responses. Socket.IO failures, requests rejected before Express, and aborted responses need separate diagnostics. Other application and dependency logs follow their own rules.
 
 ## Diagnose email delivery
 
 Successful verification sends log Resend's accepted message ID. To receive delivery events, create a TypeSync webhook in Resend for `POST https://<backend-host>/api/webhooks/resend`. Subscribe to `email.delivered`, `email.delivery_delayed`, `email.bounced`, `email.failed`, `email.complained`, and `email.suppressed`. Save its signing secret as `RESEND_WEBHOOK_SECRET` on the backend, deploy, and then enable the endpoint. Omit this variable to disable the route. An invalid configured signing secret prevents startup.
 
-Match the accepted `messageId` to delivery logs. Webhook events cover the Resend account and may include other applications' messages. Delivery means the recipient's mail server accepted the email, not that it reached the inbox or was read. Resend retries and replays can produce duplicate log entries. The handler acknowledges duplicates and has no delivery state or exactly-once guarantee.
+Match the accepted `messageId` to the delivery logs. Webhook events cover the Resend account and may include other applications' messages. A delivery event means the recipient's mail server accepted the email. It does not confirm inbox placement or that someone read it. Resend retries and replays can produce duplicate log entries. The handler acknowledges duplicates but does not track delivery state or guarantee exactly-once processing.
 
 ## Deployment database credentials
 
-Set `MIGRATION_DATABASE_URL` to the PostgreSQL login that owns the schema and runs migrations. Production requires this variable. Set `DATABASE_URL` to a separate runtime login with `CONNECT` on the database, `USAGE` on the public schema and `collaborator_role` enum, and `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on `user`, `session`, `account`, `verification`, `document`, and `document_collaborator`. Keep schema creation, table ownership, and the Drizzle migration ledger restricted to the migration login. Configure both URLs to verify the database server's TLS certificate.
+Set `MIGRATION_DATABASE_URL` to the PostgreSQL login that owns the schema and runs migrations. Production requires this variable.
 
-Docker runs migrations first, removes `MIGRATION_DATABASE_URL` from the environment, and starts the server as PID 1. A failed migration prevents server startup. The migration credential remains in the hosting provider's configuration. Locally, migration commands use `DATABASE_URL` when `MIGRATION_DATABASE_URL` is omitted. An explicit empty or invalid migration URL fails.
+Set `DATABASE_URL` to a separate runtime login. Grant `CONNECT` on the database and `USAGE` on the public schema and `collaborator_role` enum. Grant `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on `user`, `session`, `account`, `verification`, `document`, and `document_collaborator`. Keep schema creation, table ownership, and the Drizzle migration ledger restricted to the migration login. Configure both URLs to verify the database server's TLS certificate.
+
+Docker runs migrations first, removes `MIGRATION_DATABASE_URL` from the environment, and starts the server as PID 1. A failed migration prevents server startup. The migration credential remains in the hosting provider's configuration.
+
+Locally, migration commands use `DATABASE_URL` when `MIGRATION_DATABASE_URL` is omitted. An explicit empty or invalid migration URL fails.
 
 When changing an existing deployment, add `MIGRATION_DATABASE_URL` before deploying this version. Verify that deployment before changing `DATABASE_URL` to the restricted login. Rolling back to a version without this credential split also requires restoring the schema owner's `DATABASE_URL`.
 
 ## Deployment shutdown
 
-Give the server at least 30 seconds after SIGTERM before forcibly killing it. At 20 seconds, the server allows its document flush up to five more seconds before forcing exit, leaving five seconds of margin with a 30-second host grace. It starts the flush if draining has not finished or reuses an existing flush. Failed or timed-out shutdowns exit with a nonzero status.
+Give the server at least 30 seconds after SIGTERM before forcibly killing it. At 20 seconds, if draining has not finished, the server starts a document flush or reuses one already running. The flush has up to five more seconds to finish. A 30-second host grace period leaves five seconds of margin. Failed or timed-out shutdowns exit with a nonzero status.
 
 [Render's default shutdown delay](https://render.com/docs/deploys#graceful-shutdown) is 30 seconds. Keep it at 30 seconds or longer. For Docker, set `docker run --stop-timeout 30` when creating the server container, or `stop_grace_period: 30s` for a Compose server service. [Docker's default for Linux containers](https://docs.docker.com/reference/cli/docker/container/run/#stop-timeout) is only 10 seconds. The Compose file in this repository starts PostgreSQL only.
