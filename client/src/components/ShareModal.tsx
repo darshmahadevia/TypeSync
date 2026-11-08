@@ -42,7 +42,10 @@ export function ShareModal({
 
   const fetchCollaborators = useCallback(async () => {
     const requestGeneration = ++collaboratorsRequestGenerationRef.current;
-    setCollaboratorsState({ status: "loading" });
+    // Refreshes keep the current list on screen; only a first load shows the spinner.
+    setCollaboratorsState((prev) =>
+      prev.status === "loaded" ? prev : { status: "loading" }
+    );
 
     try {
       const res = await api.documents.listCollaborators(documentId);
@@ -81,6 +84,17 @@ export function ShareModal({
   ) => {
     if (isLoading) return;
     setIsLoading(true);
+    // Show the new role immediately; the refetch below confirms or corrects it.
+    setCollaboratorsState((prev) =>
+      prev.status === "loaded"
+        ? {
+            ...prev,
+            collaborators: prev.collaborators.map((c) =>
+              c.user.email === targetEmail ? { ...c, role: newRole } : c
+            ),
+          }
+        : prev
+    );
     try {
       setError("");
       setSuccess("");
@@ -91,6 +105,7 @@ export function ShareModal({
       void fetchCollaborators();
       onUpdate();
     } catch (err) {
+      void fetchCollaborators();
       setError(errorMessage(err, "Failed to update collaborator role"));
     } finally {
       setIsLoading(false);
